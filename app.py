@@ -9,14 +9,14 @@ messages_db = []
 
 @app.route('/feishu-event', methods=['POST'])
 def feishu_event():
-    """接收飞书开放平台推送事件的接口"""
+    """接收飞书开放平台云端事件推送"""
     data = request.json or {}
     
-    # 1. 处理飞书开放平台的首次 URL 校验请求（Challenge）
+    # 1. 处理飞书开放平台校验请求 (Challenge)
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
     
-    # 2. 处理接收到的群消息事件
+    # 2. 解析接收到的群消息
     header = data.get("header", {})
     event_type = header.get("event_type")
     
@@ -25,7 +25,7 @@ def feishu_event():
         message = event.get("message", {})
         sender = event.get("sender", {})
         
-        # 解析消息内容（飞书传过来的 text 是 JSON 字符串）
+        # 提取消息文本
         content_raw = message.get("content", "{}")
         try:
             content_json = json.loads(content_raw)
@@ -33,15 +33,14 @@ def feishu_event():
         except:
             content_text = content_raw
 
-        msg_item = {
-            "sender_id": sender.get("sender_id", {}).get("open_id", "未知用户"),
-            "content": content_text,
-            "msg_type": message.get("message_type"),
-            "create_time": message.get("create_time")
-        }
-        
-        # 保存到内存列表
-        if content_text:
+        sender_type = sender.get("sender_type", "")
+        # 过滤掉机器人自己发的消息，只保留人类发送的消息
+        if sender_type != "app" and content_text:
+            msg_item = {
+                "sender": sender.get("sender_id", {}).get("open_id", "群成员"),
+                "content": content_text,
+                "time": message.get("create_time", "")
+            }
             messages_db.append(msg_item)
             if len(messages_db) > 100:
                 messages_db.pop(0)
