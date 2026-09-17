@@ -1,0 +1,96 @@
+openapi: 3.1.0
+info:
+  title: A独角兽综合群消息查询
+  version: 2.0.0
+  description: 按最新、最近若干小时或指定时间范围查询已采集的飞书群消息。
+servers:
+  - url: https://feishu-gpt-bridge2.onrender.com
+paths:
+  /get-messages:
+    get:
+      operationId: get_feishu_messages
+      summary: 查询A独角兽综合群消息
+      description: |
+        时间使用 ISO 8601。北京时间示例：2026-09-17T09:00:00+08:00。
+        查询“最近N小时”时传 hours；查询指定区间时传 start_time 和 end_time。
+        如果 has_more 为 true，使用 next_before_id 继续查询更早的一页。
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: group_name
+          in: query
+          required: false
+          schema:
+            type: string
+            default: A独角兽综合群
+        - name: hours
+          in: query
+          required: false
+          description: 查询最近多少小时，可使用小数；与 start_time 同时提供时优先使用 start_time。
+          schema:
+            type: number
+            minimum: 0.01
+            maximum: 8784
+        - name: start_time
+          in: query
+          required: false
+          description: 起始时间，包含该时刻；不带时区时按 Asia/Shanghai 处理。
+          schema:
+            type: string
+            format: date-time
+        - name: end_time
+          in: query
+          required: false
+          description: 结束时间，包含该时刻；不提供时默认为当前时间。
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          required: false
+          description: 每页消息数，最多500条。
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+        - name: before_id
+          in: query
+          required: false
+          description: 分页游标，填写上一页返回的 next_before_id。
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  group:
+                    type: string
+                  count:
+                    type: integer
+                  latest_messages:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                  has_more:
+                    type: boolean
+                  next_before_id:
+                    type:
+                      - integer
+                      - "null"
+        "400":
+          description: 时间范围格式错误
+        "401":
+          description: API Key 错误
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-KEY
