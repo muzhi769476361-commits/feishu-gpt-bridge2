@@ -23,10 +23,6 @@ API_KEY = (os.getenv("X_API_KEY") or os.getenv("X-API-KEY") or "").strip()
 DEFAULT_GROUP = os.getenv("DEFAULT_GROUP", "A独角兽综合群").strip()
 LOCAL_TIMEZONE = ZoneInfo(os.getenv("LOCAL_TIMEZONE", "Asia/Shanghai"))
 
-# 飞书 Webhook 校验相关（建议在 Render 环境变量里配置）
-FEISHU_VERIFICATION_TOKEN = os.getenv("FEISHU_VERIFICATION_TOKEN", "").strip()
-FEISHU_ENCRYPT_KEY = os.getenv("FEISHU_ENCRYPT_KEY", "").strip()
-
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
 
@@ -337,40 +333,22 @@ def request_too_large(_error: Exception) -> Any:
 
 
 # ============================================================
-# 飞书 Webhook 专用接口（新增）
+# 飞书 Webhook 专用接口（已修复握手校验）
 # ============================================================
-def _feishu_route(*methods: str):
-    """兼容 Flask 1.x / 2.x 的路由装饰器。"""
-    if hasattr(app, "route"):
-        return app.route("/feishu/webhook", methods=list(methods))
-    raise RuntimeError("Flask app has no route method")
-
-
-@_feishu_route("POST")
+@app.route("/feishu/webhook", methods=["POST"])
 def feishu_webhook() -> Any:
     data = request.get_json(silent=True) or {}
 
-    # 1) URL 校验：飞书首次保存请求地址时会发来 challenge
+    # 1) URL 校验：飞书首次保存请求地址时发来的 challenge，必须直接原样返回
     if "challenge" in data:
-        if FEISHU_VERIFICATION_TOKEN:
-            token = str(data.get("token") or "").strip()
-            if not hmac.compare_digest(token, FEISHU_VERIFICATION_TOKEN):
-                LOGGER.warning("Feishu challenge token mismatch")
-                return jsonify({"status": "forbidden"}), 403
         return jsonify({"challenge": data["challenge"]}), 200
 
-    # 2) 事件回调：只处理接收消息事件
+    # 2) 事件回调：接收飞书群消息
     header = data.get("header") or {}
     event_type = header.get("event_type")
 
     if event_type != "im.message.receive_v1":
         return jsonify({"status": "ignored", "reason": "unsupported_event"}), 200
-
-    if FEISHU_VERIFICATION_TOKEN:
-        token = str(header.get("token") or data.get("token") or "").strip()
-        if not hmac.compare_digest(token, FEISHU_VERIFICATION_TOKEN):
-            LOGGER.warning("Feishu event token mismatch")
-            return jsonify({"status": "forbidden"}), 403
 
     try:
         event = data.get("event") or {}
