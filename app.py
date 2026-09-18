@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 import threading
@@ -21,6 +22,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 API_KEY = (os.getenv("X_API_KEY") or os.getenv("X-API-KEY") or "").strip()
 DEFAULT_GROUP = os.getenv("DEFAULT_GROUP", "A独角兽综合群").strip()
 LOCAL_TIMEZONE = ZoneInfo(os.getenv("LOCAL_TIMEZONE", "Asia/Shanghai"))
+
+# 飞书 Webhook 校验相关（建议在 Render 环境变量里配置）
+FEISHU_VERIFICATION_TOKEN = os.getenv("FEISHU_VERIFICATION_TOKEN", "").strip()
+FEISHU_ENCRYPT_KEY = os.getenv("FEISHU_ENCRYPT_KEY", "").strip()
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
@@ -71,7 +76,6 @@ def ensure_schema() -> None:
                 )
                 """
             )
-            # Migrate installations created by the first version in place.
             cursor.execute(
                 """
                 ALTER TABLE feishu_messages
@@ -150,8 +154,6 @@ def optional_message_datetime(value: str) -> datetime | None:
     try:
         return parse_datetime(value, "timestamp")
     except ValueError:
-        # Older collectors sometimes sent display-only values such as 09:18.
-        # Those records remain queryable by received_at.
         return None
 
 
@@ -163,8 +165,6 @@ def clean_message(data: dict[str, Any]) -> dict[str, str]:
     calculated = calculate_msg_hash(sender, content, timestamp)
     supplied = str(data.get("msg_hash") or "").strip().lower()
 
-    # Do not trust an arbitrary client hash.  Accept it only when it matches
-    # the same formula used by the VPS.
     msg_hash = supplied if hmac.compare_digest(supplied, calculated) else calculated
     return {
         "group_name": group_name,
@@ -173,6 +173,31 @@ def clean_message(data: dict[str, Any]) -> dict[str, str]:
         "timestamp": timestamp,
         "msg_hash": msg_hash,
     }
+
+
+def store_message(message: dict[str, str]) -> bool:
+    """把清洗后的消息写入数据库，返回 True 表示新插入，False 表示重复。"""
+    ensure_schema()
+    with db_connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO feishu_messages
+                (group_name, sender, content, "timestamp", msg_hash, message_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (msg_hash) DO NOTHING
+            RETURNING id
+            """,
+            (
+                message["group_name"],
+                message["sender"],
+                message["content"],
+                message["timestamp"],
+                message["msg_hash"],
+                optional_message_datetime(message["timestamp"]),
+            ),
+        )
+        inserted = cursor.fetchone()
+    return bool(inserted)
 
 
 @app.get("/")
@@ -204,27 +229,7 @@ def upload() -> Any:
     if len(message["content"]) > 200_000:
         return jsonify({"status": "ignored", "reason": "content_too_large"}), 413
 
-    ensure_schema()
-    with db_connect() as connection, connection.cursor() as cursor:
-        cursor.execute(
-            """
-            INSERT INTO feishu_messages
-                (group_name, sender, content, "timestamp", msg_hash, message_at)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (msg_hash) DO NOTHING
-            RETURNING id
-            """,
-            (
-                message["group_name"],
-                message["sender"],
-                message["content"],
-                message["timestamp"],
-                message["msg_hash"],
-                optional_message_datetime(message["timestamp"]),
-            ),
-        )
-        inserted = cursor.fetchone()
-
+    inserted = store_message(message)
     return jsonify(
         {
             "status": "stored" if inserted else "duplicate",
@@ -297,7 +302,6 @@ def get_messages() -> Any:
 
     has_more = len(rows) > limit
     rows = rows[:limit]
-    # Return the selected newest messages in chronological order for GPT.
     messages = [
         {
             "id": row[0],
@@ -330,6 +334,115 @@ def get_messages() -> Any:
 @app.errorhandler(413)
 def request_too_large(_error: Exception) -> Any:
     return jsonify({"status": "ignored", "reason": "request_too_large"}), 413
+
+
+# ============================================================
+# 飞书 Webhook 专用接口（新增）
+# ============================================================
+def _feishu_route(*methods: str):
+    """兼容 Flask 1.x / 2.x 的路由装饰器。"""
+    if hasattr(app, "route"):
+        return app.route("/feishu/webhook", methods=list(methods))
+    raise RuntimeError("Flask app has no route method")
+
+
+@_feishu_route("POST")
+def feishu_webhook() -> Any:
+    data = request.get_json(silent=True) or {}
+
+    # 1) URL 校验：飞书首次保存请求地址时会发来 challenge
+    if "challenge" in data:
+        if FEISHU_VERIFICATION_TOKEN:
+            token = str(data.get("token") or "").strip()
+            if not hmac.compare_digest(token, FEISHU_VERIFICATION_TOKEN):
+                LOGGER.warning("Feishu challenge token mismatch")
+                return jsonify({"status": "forbidden"}), 403
+        return jsonify({"challenge": data["challenge"]}), 200
+
+    # 2) 事件回调：只处理接收消息事件
+    header = data.get("header") or {}
+    event_type = header.get("event_type")
+
+    if event_type != "im.message.receive_v1":
+        return jsonify({"status": "ignored", "reason": "unsupported_event"}), 200
+
+    if FEISHU_VERIFICATION_TOKEN:
+        token = str(header.get("token") or data.get("token") or "").strip()
+        if not hmac.compare_digest(token, FEISHU_VERIFICATION_TOKEN):
+            LOGGER.warning("Feishu event token mismatch")
+            return jsonify({"status": "forbidden"}), 403
+
+    try:
+        event = data.get("event") or {}
+        message = event.get("message") or {}
+        sender_info = event.get("sender") or {}
+
+        msg_type = message.get("message_type")
+        if msg_type != "text":
+            return jsonify({"status": "ignored", "reason": "non_text_message"}), 200
+
+        content_raw = message.get("content") or "{}"
+        try:
+            content_json = (
+                content_raw
+                if isinstance(content_raw, dict)
+                else json.loads(content_raw)
+            )
+        except Exception:
+            content_json = {}
+        text = str(content_json.get("text") or "").strip()
+
+        if not text:
+            return jsonify({"status": "ignored", "reason": "empty_content"}), 200
+
+        sender_id = sender_info.get("sender_id") or {}
+        sender = (
+            sender_id.get("open_id")
+            or sender_id.get("user_id")
+            or sender_id.get("union_id")
+            or "未知发送者"
+        )
+
+        chat_id = str(message.get("chat_id") or "").strip()
+        group_name = chat_id or DEFAULT_GROUP
+
+        create_time = message.get("create_time")
+        if create_time:
+            try:
+                ts = datetime.fromtimestamp(
+                    int(create_time) / 1000, tz=timezone.utc
+                )
+                timestamp = ts.astimezone(LOCAL_TIMEZONE).isoformat()
+            except Exception:
+                timestamp = datetime.now(LOCAL_TIMEZONE).isoformat()
+        else:
+            timestamp = datetime.now(LOCAL_TIMEZONE).isoformat()
+
+        msg = clean_message(
+            {
+                "group_name": group_name,
+                "sender": sender,
+                "content": text,
+                "timestamp": timestamp,
+            }
+        )
+        inserted = store_message(msg)
+        LOGGER.info(
+            "Feishu webhook stored=%s group=%s sender=%s",
+            inserted,
+            group_name,
+            sender,
+        )
+        return jsonify(
+            {
+                "status": "stored" if inserted else "duplicate",
+                "msg_hash": msg["msg_hash"],
+            }
+        ), 200
+
+    except Exception:
+        LOGGER.exception("Failed to handle Feishu webhook event")
+        return jsonify({"status": "error"}), 200
 
 
 if __name__ == "__main__":
