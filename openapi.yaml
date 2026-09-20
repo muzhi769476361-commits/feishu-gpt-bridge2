@@ -78,6 +78,29 @@ paths:
                     items:
                       type: object
                       additionalProperties: true
+                  observed_at:
+                    type: string
+                    format: date-time
+                    description: API 本次查询时间，不等于群消息产生时间。
+                  collector:
+                    type: object
+                    description: 云端采集器心跳；is_running 为 false 时不得把旧消息称为实时消息。
+                    properties:
+                      is_running:
+                        type: boolean
+                      last_seen_at:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      seconds_since_heartbeat:
+                        type:
+                          - integer
+                          - "null"
+                      dom_message_count:
+                        type:
+                          - integer
+                          - "null"
                   has_more:
                     type: boolean
                   next_before_id:

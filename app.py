@@ -111,6 +111,15 @@ def ensure_schema() -> None:
                     (group_name, message_at DESC, received_at DESC, id DESC)
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS collector_heartbeats (
+                    group_name TEXT PRIMARY KEY,
+                    last_seen_at TIMESTAMPTZ NOT NULL,
+                    dom_message_count INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
         _schema_ready = True
 
 
@@ -234,6 +243,36 @@ def upload() -> Any:
     ), 201 if inserted else 200
 
 
+@app.post("/heartbeat")
+def heartbeat() -> Any:
+    if not authorized():
+        return jsonify({"status": "unauthorized"}), 401
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"status": "invalid_json"}), 400
+    group_name = str(data.get("group_name") or DEFAULT_GROUP).strip()[:200]
+    try:
+        node_count = int(data.get("dom_message_count", 0))
+    except (TypeError, ValueError):
+        return jsonify({"status": "invalid_dom_message_count"}), 400
+    if not group_name or not 0 <= node_count <= 100_000:
+        return jsonify({"status": "invalid_heartbeat"}), 400
+    ensure_schema()
+    with db_connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO collector_heartbeats
+                (group_name, last_seen_at, dom_message_count)
+            VALUES (%s, NOW(), %s)
+            ON CONFLICT (group_name) DO UPDATE SET
+                last_seen_at = EXCLUDED.last_seen_at,
+                dom_message_count = EXCLUDED.dom_message_count
+            """,
+            (group_name, node_count),
+        )
+    return jsonify({"status": "ok"}), 200
+
+
 @app.get("/get-messages")
 def get_messages() -> Any:
     if not authorized():
@@ -295,6 +334,20 @@ def get_messages() -> Any:
     with db_connect() as connection, connection.cursor() as cursor:
         cursor.execute(sql, params)
         rows = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT last_seen_at, dom_message_count
+            FROM collector_heartbeats WHERE group_name = %s
+            """,
+            (group_name,),
+        )
+        heartbeat_row = cursor.fetchone()
+
+    observed_at = datetime.now(timezone.utc)
+    heartbeat_age = (
+        max(0, int((observed_at - heartbeat_row[0]).total_seconds()))
+        if heartbeat_row else None
+    )
 
     has_more = len(rows) > limit
     rows = rows[:limit]
@@ -323,6 +376,13 @@ def get_messages() -> Any:
             },
             "has_more": has_more,
             "next_before_id": messages[0]["id"] if has_more and messages else None,
+            "collector": {
+                "is_running": heartbeat_age is not None and heartbeat_age <= 180,
+                "last_seen_at": heartbeat_row[0].isoformat() if heartbeat_row else None,
+                "seconds_since_heartbeat": heartbeat_age,
+                "dom_message_count": heartbeat_row[1] if heartbeat_row else None,
+            },
+            "observed_at": observed_at.isoformat(),
         }
     ), 200
 

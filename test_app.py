@@ -10,6 +10,7 @@ class FakeCursor:
         self.rows = rows
         self.sql = ""
         self.params = []
+        self.executed = []
 
     def __enter__(self):
         return self
@@ -20,9 +21,13 @@ class FakeCursor:
     def execute(self, sql, params=None):
         self.sql = sql
         self.params = params or []
+        self.executed.append((sql, params))
 
     def fetchall(self):
         return self.rows
+
+    def fetchone(self):
+        return None
 
 
 class FakeConnection:
@@ -79,8 +84,25 @@ class MessageQueryTests(unittest.TestCase):
         self.assertEqual(response.json["count"], 2)
         self.assertTrue(response.json["has_more"])
         self.assertEqual(response.json["next_before_id"], 2)
-        self.assertIn("COALESCE(message_at, received_at) >=", cursor.sql)
-        self.assertIn("id <", cursor.sql)
+        self.assertIn("COALESCE(message_at, received_at) >=", cursor.executed[0][0])
+        self.assertIn("id <", cursor.executed[0][0])
+        self.assertFalse(response.json["collector"]["is_running"])
+
+    def test_heartbeat_requires_key_and_stores_group_state(self):
+        cursor = FakeCursor([])
+        with (
+            patch.object(api, "ensure_schema"),
+            patch.object(api, "db_connect", return_value=FakeConnection(cursor)),
+        ):
+            denied = self.client.post("/heartbeat", json={"dom_message_count": 4})
+            accepted = self.client.post(
+                "/heartbeat",
+                json={"group_name": "A独角兽综合群", "dom_message_count": 4},
+                headers=self.headers,
+            )
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(accepted.status_code, 200)
+        self.assertIn("INSERT INTO collector_heartbeats", cursor.sql)
 
 
 if __name__ == "__main__":
