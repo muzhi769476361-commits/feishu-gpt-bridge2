@@ -9,11 +9,14 @@ paths:
   /get-messages:
     get:
       operationId: get_feishu_messages
-      summary: 查询A独角兽综合群消息
+      summary: 按群消息时间查询A独角兽综合群消息
       description: |
         时间使用 ISO 8601。北京时间示例：2026-09-17T09:00:00+08:00。
-        查询“最近N小时”时传 hours；查询指定区间时传 start_time 和 end_time。
+        查询“最近N小时”时传 hours；区间终点自动取该群最后一条已采集消息的 event_time，
+        而不是当前系统时间。查询指定区间时传 start_time 和 end_time。
         如果 has_more 为 true，使用 next_before_id 继续查询更早的一页。
+        返回的 latest_messages 按群消息时间升序排列，最后一项为该查询范围内最新的已采集消息；
+        不要把 API 查询时间 observed_at 当作群消息时间。
       security:
         - ApiKeyAuth: []
       parameters:
@@ -41,7 +44,7 @@ paths:
         - name: end_time
           in: query
           required: false
-          description: 结束时间，包含该时刻；不提供时默认为当前时间。
+          description: 结束时间，包含该时刻；仅传 hours 而不传本字段时，自动取该群最后一条已采集消息的时间。
           schema:
             type: string
             format: date-time
@@ -77,17 +80,76 @@ paths:
                     type: array
                     items:
                       type: object
+                      properties:
+                        id:
+                          type: integer
+                        content:
+                          type: string
+                          description: 消息正文；图片消息会附带“图片文字识别”结果。
+                        event_time:
+                          type: string
+                          format: date-time
+                          description: 群消息时间；判断“最新”应使用此字段。
+                        received_at:
+                          type: string
+                          format: date-time
+                          description: 数据入库时间，不代表群消息发布时间。
+                        image_count:
+                          type: integer
+                          description: 此消息包含的图片数量。
+                        image_ocr:
+                          type: string
+                          description: 图片识别出的文字；为空时不得臆测图片内容。
                       additionalProperties: true
+                  range:
+                    type: object
+                    properties:
+                      anchor:
+                        type:
+                          - string
+                          - "null"
+                        description: hours 自动取最后一条群消息时为 latest_group_message。
+                      anchor_message_at:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      start_time:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      end_time:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
                   observed_at:
                     type: string
                     format: date-time
                     description: API 本次查询时间，不等于群消息产生时间。
                   collector:
                     type: object
-                    description: 云端采集器心跳；is_running 为 false 时不得把旧消息称为实时消息。
+                    description: 云端短周期增量同步状态；is_running 为 false 时不得把旧消息称为实时消息。
                     properties:
+                      mode:
+                        type: string
+                        description: scheduled_incremental 表示定时启动、完成即退出。
                       is_running:
                         type: boolean
+                      sync_status:
+                        type:
+                          - string
+                          - "null"
+                      last_sync_success_at:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      seconds_since_sync_success:
+                        type:
+                          - integer
+                          - "null"
                       last_seen_at:
                         type:
                           - string
