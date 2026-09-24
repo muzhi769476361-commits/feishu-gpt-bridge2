@@ -95,6 +95,38 @@ def ensure_schema() -> None:
                       '^\\d{4}-\\d{2}-\\d{2}[T ][0-2]\\d:[0-5]\\d:[0-5]\\d'
                 """
             )
+            # Repair messages collected shortly after midnight whose Feishu
+            # DOM exposed only HH:MM. Older collectors assigned those clock
+            # values to the new calendar day, producing impossible future
+            # message_at values. Remove an exact prior-day duplicate first,
+            # then move any remaining affected record back one day.
+            cursor.execute(
+                """
+                DELETE FROM feishu_messages AS bad
+                USING feishu_messages AS good
+                WHERE bad.id <> good.id
+                  AND bad.message_at > bad.received_at + INTERVAL '5 minutes'
+                  AND good.group_name = bad.group_name
+                  AND good.sender = bad.sender
+                  AND good.content = bad.content
+                  AND good.message_at BETWEEN
+                      bad.message_at - INTERVAL '1 day 2 seconds'
+                      AND bad.message_at - INTERVAL '23 hours 59 minutes 58 seconds'
+                """
+            )
+            cursor.execute(
+                """
+                UPDATE feishu_messages
+                SET message_at = message_at - INTERVAL '1 day',
+                    "timestamp" = to_char(
+                        (message_at - INTERVAL '1 day')
+                            AT TIME ZONE 'Asia/Shanghai',
+                        'YYYY-MM-DD"T"HH24:MI:SS'
+                    ) || '+08:00'
+                WHERE message_at > received_at + INTERVAL '5 minutes'
+                  AND message_at <= received_at + INTERVAL '1 day 5 minutes'
+                """
+            )
             cursor.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS
