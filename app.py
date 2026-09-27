@@ -13,7 +13,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import psycopg
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -291,6 +291,14 @@ def health() -> Any:
     except Exception as exc:
         LOGGER.exception("Database health check failed")
         return jsonify({"status": "error", "detail": str(exc)}), 503
+
+
+@app.get("/openapi.yaml")
+def openapi_schema() -> Any:
+    """Serve the public Actions schema without database or API-key access."""
+    return send_from_directory(
+        app.root_path, "openapi.yaml", mimetype="application/yaml"
+    )
 
 
 @app.post("/upload")
@@ -582,11 +590,15 @@ def get_messages() -> Any:
         max(0, int((observed_at - sync_row[2]).total_seconds()))
         if sync_row and sync_row[2] else None
     )
-    scheduled_healthy = (
-        bool(sync_row)
-        and (sync_row[0] == "started" or (
-            sync_success_age is not None and sync_success_age <= 15 * 60
-        ))
+    sync_started_age = (
+        max(0, int((observed_at - sync_row[1]).total_seconds()))
+        if sync_row and sync_row[1] else None
+    )
+    scheduled_healthy = bool(sync_row) and (
+        (sync_row[0] == "started" and sync_started_age is not None
+         and sync_started_age <= 15 * 60)
+        or (sync_row[0] == "success" and sync_success_age is not None
+            and sync_success_age <= 15 * 60)
     )
 
     has_more = len(rows) > limit

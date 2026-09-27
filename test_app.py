@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import app as api
@@ -50,6 +50,36 @@ class MessageQueryTests(unittest.TestCase):
         api.API_KEY = "test-key"
         self.client = api.app.test_client()
         self.headers = {"X-API-KEY": "test-key"}
+
+    def test_actions_schema_available_without_key_or_database(self):
+        with patch.object(api, "db_connect") as connect:
+            response = self.client.get("/openapi.yaml")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn(b"operationId: get_feishu_messages", response.data)
+            connect.assert_not_called()
+            response.close()
+
+    def test_sync_health_expires_and_reports_errors(self):
+        now = datetime.now(timezone.utc)
+        cases = [
+            ("started", now - timedelta(hours=2), now, False),
+            ("started", now, None, True),
+            ("started", None, now, False),
+            ("error", now, now, False),
+            ("success", now, now, True),
+            ("success", now, now - timedelta(hours=2), False),
+        ]
+        for status, started, success, expected in cases:
+            with self.subTest(status=status, started=started, success=success):
+                cursor = FakeCursor([], [None,
+                    (status, started, success, now, 0, "")])
+                with (
+                    patch.object(api, "ensure_schema"),
+                    patch.object(api, "db_connect", return_value=FakeConnection(cursor)),
+                ):
+                    response = self.client.get("/get-messages", headers=self.headers)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json["collector"]["is_running"], expected)
 
     def test_rejects_reversed_range(self):
         response = self.client.get(
