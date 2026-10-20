@@ -70,7 +70,8 @@ def ensure_schema() -> None:
                     message_at TIMESTAMPTZ,
                     received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     image_count INTEGER NOT NULL DEFAULT 0,
-                    image_ocr TEXT NOT NULL DEFAULT ''
+                    image_ocr TEXT NOT NULL DEFAULT '',
+                    source_message_id TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
@@ -83,6 +84,8 @@ def ensure_schema() -> None:
                     ADD COLUMN IF NOT EXISTS image_count INTEGER
                         NOT NULL DEFAULT 0,
                     ADD COLUMN IF NOT EXISTS image_ocr TEXT
+                        NOT NULL DEFAULT '',
+                    ADD COLUMN IF NOT EXISTS source_message_id TEXT
                         NOT NULL DEFAULT ''
                 """
             )
@@ -183,8 +186,12 @@ def authorized() -> bool:
     return bool(supplied) and hmac.compare_digest(supplied, API_KEY)
 
 
-def calculate_msg_hash(sender: str, content: str, timestamp: str) -> str:
-    raw = f"{sender}{content}{timestamp}".encode("utf-8", errors="replace")
+def calculate_msg_hash(
+    sender: str, content: str, timestamp: str, source_message_id: str = ""
+) -> str:
+    raw = f"{sender}{content}{timestamp}{source_message_id}".encode(
+        "utf-8", errors="replace"
+    )
     return hashlib.md5(raw, usedforsecurity=False).hexdigest()
 
 
@@ -219,7 +226,8 @@ def clean_message(data: dict[str, Any]) -> dict[str, Any]:
     sender = str(data.get("sender") or "未知发送者").strip()[:500]
     content = str(data.get("content") or "").strip()
     timestamp = str(data.get("timestamp") or data.get("time") or "").strip()[:200]
-    calculated = calculate_msg_hash(sender, content, timestamp)
+    source_message_id = str(data.get("source_message_id") or "").strip()[:500]
+    calculated = calculate_msg_hash(sender, content, timestamp, source_message_id)
     supplied = str(data.get("msg_hash") or "").strip().lower()
     try:
         image_count = int(data.get("image_count") or 0)
@@ -238,6 +246,7 @@ def clean_message(data: dict[str, Any]) -> dict[str, Any]:
         "msg_hash": msg_hash,
         "image_count": image_count,
         "image_ocr": image_ocr,
+        "source_message_id": source_message_id,
     }
 
 
@@ -249,8 +258,8 @@ def store_message(message: dict[str, Any]) -> bool:
             """
             INSERT INTO feishu_messages
                 (group_name, sender, content, "timestamp", msg_hash, message_at,
-                 image_count, image_ocr)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                 image_count, image_ocr, source_message_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (msg_hash) DO UPDATE SET
                 image_count = GREATEST(
                     feishu_messages.image_count, EXCLUDED.image_count
@@ -273,6 +282,7 @@ def store_message(message: dict[str, Any]) -> bool:
                 optional_message_datetime(message["timestamp"]),
                 message["image_count"],
                 message["image_ocr"],
+                message["source_message_id"],
             ),
         )
         inserted = cursor.fetchone()
@@ -535,7 +545,7 @@ def get_messages() -> Any:
     sql = """
         SELECT id, group_name, sender, content, "timestamp", msg_hash,
                COALESCE(message_at, received_at) AS event_time,
-               received_at, image_count, image_ocr
+               received_at, image_count, image_ocr, source_message_id
         FROM feishu_messages
         WHERE group_name = %s
     """
@@ -614,7 +624,14 @@ def get_messages() -> Any:
             "event_time": row[6].isoformat(),
             "received_at": row[7].isoformat(),
             "image_count": row[8],
-            "image_ocr": row[9],
+            "image_ocr": (
+                row[9]
+                or (
+                    "图片 OCR 未识别出可靠文字；该图片消息已保留，请勿按空消息省略。"
+                    if row[8] > 0 else ""
+                )
+            ),
+            "source_message_id": row[10],
         }
         for row in reversed(rows)
     ]
